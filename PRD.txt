@@ -1,0 +1,347 @@
+# PRD: Adaptive Daily Learning System (5-Day Solo MVP)
+
+## 1. Problem Statement
+
+Learners fail to complete self-directed goals because they lack structured daily guidance and adaptive recovery when life disrupts their plans. This MVP demonstrates a system that enforces daily learning discipline and automatically adjusts the learning path based on actual user behavior.
+
+## 2. Product Goal & Non-Goals
+
+**Goal**: Build a functional prototype demonstrating:
+- AI-generated learning syllabi broken into daily topics
+- Mandatory daily input that blocks progression
+- Adaptive syllabus logic (completed/skipped/leave)
+- Topic-specific AI assistance (no global chatbot)
+- Calendar system that mirrors syllabus state
+
+**Non-Goals**:
+- Production authentication or security
+- Real Google Calendar integration
+- Mobile native apps
+- Social features or analytics
+- Payment systems
+- Email notifications
+- Multi-user support
+
+## 3. Primary User Flow (Happy Path Only)
+
+```
+1. Open app → hardcoded user session (no login)
+2. Create plan: "Learn React.js", 1 hour/day, 30 days
+3. AI generates 30-day syllabus → internal calendar auto-populated
+4. Day 1: Click topic → see content + "Ask AI" button
+5. Ask topic-specific questions → AI responds in context
+6. Click "End Day" → modal: "What did you learn today?"
+7. Submit input (mandatory) → Day 1 marked complete
+8. System re-evaluates, regenerates remaining days
+9. Calendar updates automatically with new dates/topics
+10. Next day repeats
+```
+
+## 4. Core Loop Diagram
+
+```
+[Generate Syllabus]
+       ↓
+[Populate Calendar]
+       ↓
+Daily Cycle:
+  View Topic → Ask AI → Submit Learning Input
+       ↓
+[Adaptation Engine]
+  Analyze input → Update syllabus → Regenerate calendar
+       ↓
+[Next Day] → Repeat
+```
+
+## 5. Feature Breakdown
+
+### What Exists
+
+**A. Syllabus Generation**
+- Form: goal text, hours/day, total days
+- OpenAI API generates: `{day, topic, subtasks, aiExpertPrompt}`
+- Display as vertical timeline with day markers
+
+**B. Daily Learning Page**
+- Shows: day number, topic, subtasks list
+- "Ask AI Expert" opens chat interface
+- AI system prompt: "You are an expert in [topic]. Only answer questions about [topic]."
+- Chat clears between days (no history)
+
+**C. Mandatory Daily Input**
+- "End Day" button triggers modal
+- Text input: "What did you learn today?" (min 50 chars)
+- Cannot access next day without submission
+- Submission triggers adaptation
+
+**D. Adaptation Logic**
+- **Completed**: Submitted input → AI evaluates → may adjust remaining topics
+- **Skipped**: No submission by midnight → push all future days +1
+- **Leave**: User applies N-day leave → push all future days +N
+- After each change, regenerate days [current+1...end]
+
+**E. Internal Calendar System**
+- Table view: Date | Time | Topic | Notes
+- Auto-populated when syllabus created
+- Each entry: date, time (user's preferred hour), topic, AI-generated notes
+- **Key behavior**: Calendar regenerates completely when syllabus updates
+- Visual indicator shows which entries changed
+
+**F. Simulated Google Calendar Preview**
+- Button: "Preview as Google Calendar"
+- Displays iCal-formatted text showing what would sync
+- Demonstrates calendar integration concept without OAuth
+
+**G. LinkedIn Draft Generator**
+- Button on completed days: "Generate Post"
+- AI creates draft from topic + learning input
+- Copy to clipboard (no actual posting)
+
+### What Does NOT Exist (Out of Scope)
+
+- User accounts, authentication, passwords
+- Real Google Calendar OAuth or API calls
+- Email system (signup, reset, reminders)
+- Profile management or settings page
+- Mobile-specific UI (desktop only, basic responsive CSS)
+- Historical analytics or dashboards
+- Multiple syllabi per user
+- Token encryption or session security
+- Error tracking beyond console logs
+
+## 6. System State Transitions
+
+| Day State | Trigger | Syllabus Action | Calendar Action |
+|-----------|---------|-----------------|-----------------|
+| **Pending** | Future day | None | Entry exists |
+| **Active** | Current day | None | Highlighted |
+| **Completed** | User submits input | AI evaluates → may regenerate remaining days | All future entries regenerate if syllabus changes |
+| **Skipped** | Midnight passes, no input | Shift remaining days +1 | All future dates +1 |
+| **Leave** | User applies leave | Shift remaining days +N | All future dates +N |
+
+### Adaptation Rules (Simplified)
+
+```
+IF completed:
+  - Pass learning input to AI
+  - AI returns: "continue" OR "adjust" with new topics
+  - IF adjust: regenerate days [current+1...end]
+  - Trigger calendar regeneration
+
+IF skipped:
+  - Add 1 day to all future entries
+  - No topic changes
+
+IF leave (N days):
+  - Add N days to all future entries
+  - No topic changes
+```
+
+## 7. Data Model (Minimal)
+
+```javascript
+// Hardcoded user (no auth)
+const user = {
+  id: "demo_user",
+  name: "Demo User",
+  preferredStudyTime: "20:00"
+};
+
+// Syllabus (single active syllabus)
+{
+  id: "syl_1",
+  goal: "Learn React.js",
+  hoursPerDay: 1,
+  totalDays: 30,
+  startDate: "2026-01-10",
+  days: [
+    {
+      dayNumber: 1,
+      date: "2026-01-10", // Calculated from startDate
+      topic: "JSX Basics",
+      subtasks: ["Learn JSX syntax", "Build first component"],
+      aiExpertPrompt: "You are a React JSX expert...",
+      status: "pending" | "completed" | "skipped" | "leave",
+      learningInput: null,
+      completedAt: null
+    }
+    // ... 29 more
+  ]
+}
+
+// Calendar (derived view, regenerated on demand)
+{
+  entries: [
+    {
+      date: "2026-01-10",
+      time: "20:00",
+      dayNumber: 1,
+      topic: "JSX Basics",
+      notes: "Focus on JSX syntax rules and differences from HTML"
+    }
+    // ... 29 more
+  ]
+}
+
+// Chat (ephemeral, in-memory only)
+{
+  dayNumber: 1,
+  messages: [
+    {role: "system", content: aiExpertPrompt},
+    {role: "user", content: "What is JSX?"},
+    {role: "assistant", content: "..."}
+  ]
+}
+```
+
+## 8. Demo Walkthrough
+
+**Setup (30 sec)**
+1. Open app → see "Create Learning Plan" form
+2. Enter: "Master Python", 1.5 hrs/day, 14 days
+3. Click Generate → 5s loading → 14-day syllabus appears
+
+**Day 1 (90 sec)**
+4. Click "Start Day 1" → see topic + subtasks
+5. Click "Ask AI Expert" → type "Difference between lists and tuples?"
+6. AI responds in Python Basics context
+7. Click "End Day" → modal blocks screen
+8. Type learning summary (75 chars minimum shown)
+9. Submit → "Day 1 Complete ✓" → loading 3s
+
+**Calendar View (20 sec)**
+10. Click "Calendar" tab → see 14 entries
+11. Day 2 is tomorrow at 8 PM, shows "Data Structures - Lists"
+
+**Adaptation (45 sec)**
+12. Click "Apply Leave" → enter 2 days
+13. Submit → calendar regenerates
+14. Day 4 now shows date 2 days later, all subsequent shifted
+
+**Simulated Export (15 sec)**
+15. Click "Preview Google Calendar Format"
+16. Modal shows iCal text format (demonstrates integration concept)
+
+**LinkedIn Draft (15 sec)**
+17. Back to Day 1 (completed), click "Generate LinkedIn Post"
+18. Draft appears, click "Copy"
+
+**Total: ~3.5 minutes**
+
+## 9. Why This Scope Is Sufficient for Evaluation
+
+This MVP demonstrates:
+
+**Daily Use Enforcement**: 
+- Modal blocks progression without input
+- Calendar shows daily commitment visually
+
+**Adaptation Mechanism**: 
+- Three state types with distinct behaviors
+- AI evaluates input quality and adjusts syllabus
+- Calendar automatically reflects all changes
+
+**System Clarity**: 
+- Single clear loop: generate → learn → input → adapt
+- Explicit state machine (pending/completed/skipped/leave)
+- Calendar is transparent mirror of syllabus state
+
+**System Coherence**: 
+- Topic-bound AI (not a general chatbot)
+- Calendar updates are coupled to syllabus updates
+- Each day is atomic unit with clear boundaries
+
+**What's Not Needed for Evaluation**:
+- Real OAuth (simulated export demonstrates concept)
+- Auth system (detracts from core loop evaluation)
+- Mobile optimization (desktop demo is sufficient)
+- Production security (not the evaluation target)
+
+---
+
+## 10. Technical Implementation (5-Day Plan)
+
+### Minimal Stack
+
+**Frontend**: React + Vite, Tailwind CSS  
+**Backend**: Express.js + in-memory store (or SQLite for persistence)  
+**AI**: OpenAI API (gpt-4o-mini for syllabus, gpt-3.5-turbo for chat)  
+**Hosting**: Local or Vercel (for demo day)
+
+**Cost**: ~$5 total (AI API usage only)
+
+### Development Schedule
+
+**Day 1 (8 hrs)**: Foundation
+- Project setup (React + Express)
+- Syllabus generation form
+- OpenAI integration for syllabus generation
+- Display syllabus timeline
+- Test with sample output
+
+**Day 2 (8 hrs)**: Daily Learning
+- Day detail page (topic + subtasks)
+- AI chat interface with topic-specific prompts
+- OpenAI chat completion endpoint
+- Chat state management
+- Test AI context boundaries
+
+**Day 3 (8 hrs)**: Mandatory Input + Adaptation
+- End day modal (blocks progression)
+- Learning input submission
+- Adaptation engine logic (completed/skipped/leave)
+- AI evaluation of learning input
+- Syllabus regeneration
+- Test all state transitions
+
+**Day 4 (8 hrs)**: Calendar System
+- Internal calendar generation from syllabus
+- Calendar display component (table view)
+- Auto-regeneration on syllabus changes
+- Visual diff (highlight changed entries)
+- Leave application UI
+- Simulated Google Calendar export (iCal format)
+
+**Day 5 (8 hrs)**: Polish + Testing
+- LinkedIn post generator
+- UI polish (loading states, error messages)
+- End-to-end testing (full happy path)
+- Edge case handling (e.g., skip multiple days)
+- Basic responsive CSS
+- Deployment prep
+
+### Key Technical Decisions
+
+1. **No database**: Use in-memory JS object or SQLite (simpler than PostgreSQL)
+2. **No auth**: Hardcoded user session (localStorage or cookie)
+3. **Calendar regeneration**: Replace entire array (simpler than incremental updates)
+4. **AI prompts**: Template strings with topic injection
+5. **No state library**: React Context sufficient for single-user scope
+
+### Debug Priorities
+
+**High Priority**:
+- Syllabus regeneration logic (most complex)
+- AI prompt injection (topic boundary enforcement)
+- Calendar date arithmetic (off-by-one bugs)
+
+**Medium Priority**:
+- Modal blocking behavior (cannot bypass)
+- OpenAI API error handling
+
+**Low Priority**:
+- UI edge cases
+- Loading animations
+
+### Testing Strategy (Minimal)
+
+- Manual testing of happy path (repeatable script)
+- Console.log at state transitions
+- Test with 3-day syllabus (faster iteration)
+- Verify calendar updates after each state change
+
+---
+
+**Total Scope**: ~40 hours solo work  
+**Deployment**: Single-page app, one backend, one AI integration  
+**Demo Readiness**: Fully functional for 3.5 min walkthrough

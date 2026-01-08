@@ -1,0 +1,171 @@
+/* End Day Modal - Luxury Dark Theme */
+/* Uses design tokens from App.css */
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.9);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background-color: var(--bg-overlay);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  padding: 0;
+  max-width: 600px;
+  width: 90%;
+  max-height: 90vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-content-header {
+  padding: var(--spacing-xl) var(--spacing-2xl) var(--spacing-lg) var(--spacing-2xl);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.modal-content-header h2 {
+  color: var(--text-primary);
+  margin-bottom: var(--spacing-sm);
+  font-weight: 600;
+  font-size: var(--font-size-2xl);
+}
+
+.modal-subtitle {
+  color: var(--text-secondary);
+  margin-bottom: var(--spacing-md);
+  font-size: var(--font-size-base);
+}
+
+.mandatory-warning {
+  color: var(--accent-primary);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  margin-top: var(--spacing-lg);
+  margin-bottom: 0;
+  text-align: center;
+  padding: var(--spacing-sm);
+  background-color: rgba(139, 92, 246, 0.1);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-accent);
+}
+
+.modal-content-body {
+  padding: var(--spacing-2xl);
+  flex: 1;
+}
+
+.end-day-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.learning-input {
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: inherit;
+  resize: vertical;
+  min-height: 140px;
+  line-height: 1.6;
+}
+
+.learning-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+  background-color: var(--bg-secondary);
+}
+
+.learning-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.input-counter {
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.valid-indicator {
+  color: var(--accent-primary);
+  font-weight: bold;
+  font-size: var(--font-size-lg);
+}
+
+.modal-error {
+  padding: 0.875rem 1rem;
+  background-color: rgba(220, 38, 38, 0.1);
+  color: #f87171;
+  border-radius: 8px;
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  font-size: 0.9rem;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 1rem;
+  justify-content: flex-end;
+  margin-top: 1.25rem;
+}
+
+.skip-button,
+.leave-button {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.skip-button:hover:not(:disabled),
+.leave-button:hover:not(:disabled) {
+  background-color: var(--bg-secondary);
+  border-color: var(--border-visible);
+}
+
+.skip-button:disabled,
+.leave-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.modal-actions .submit-button {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  background-color: var(--accent-primary);
+  color: white;
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  cursor: pointer;
+  font-weight: 500;
+  transition: background-color 0.2s;
+}
+
+.modal-actions .submit-button:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+}
+
+.modal-actions .submit-button:disabled {
+  background-color: var(--bg-tertiary);
+  cursor: not-allowed;
+  color: var(--text-secondary);
+}
