@@ -23,6 +23,8 @@ LAIPath helps learners complete self-directed goals by providing:
 - ✅ **Calendar View** - Visual calendar showing all learning days
 - ✅ **Day State Management** - Complete, skip, or apply leave to days
 - ✅ **LinkedIn Draft Generator** - Generate social media posts from completed days
+- ✅ **Profile Management** - Accessible from any tab, view stats, edit profile
+- ✅ **Gamification** - XP tracking, streak counter, level system with milestones
 - ✅ **Theme Support** - Dark/light theme switching
 - ✅ **Supabase Integration** - Optional cloud storage for syllabus persistence
 
@@ -125,6 +127,8 @@ Open `http://localhost:5173` in your browser.
 
 ```
 LAIPath/
+├── api/                          # Vercel serverless functions
+│   └── index.js                  # Serverless function entry point
 ├── src/                          # Frontend React application
 │   ├── App.jsx                   # Main app component
 │   ├── LandingPage.jsx           # Landing page with auth
@@ -142,7 +146,9 @@ LAIPath/
 ├── scripts/                      # Utility scripts
 │   ├── demoCheck.js              # Demo mode checker
 │   └── e2eTest.js                # End-to-end tests
-├── package.json                  # Frontend dependencies
+├── dist/                         # Build output (generated)
+├── package.json                  # Root dependencies (includes backend)
+├── vercel.json                   # Vercel configuration
 └── vite.config.js               # Vite configuration
 ```
 
@@ -230,6 +236,63 @@ See `TEST_CHECKLIST.md` and `E2E_TEST_RESULTS.md` for test results.
 - Auto-populates from syllabus
 - Updates automatically when syllabus changes
 - Shows dates, topics, and status
+
+### Profile & Gamification
+- **Profile Access** - Accessible from any tab via navigation
+- **XP System** - Earn XP for completed days and streaks
+- **Level System** - Level up based on XP (100 XP per level)
+- **Streak Tracking** - Track consecutive learning days
+- **Milestones** - Unlock milestones at levels 3, 5, 8, and 12
+- **Profile Stats** - View XP, level, and streak in dropdown and profile page
+
+## 🚀 Deployment
+
+LAIPath can be deployed as a **full-stack application on Vercel** (recommended) or with separate frontend/backend hosting.
+
+### Full-Stack Vercel Deployment (Recommended)
+
+Deploy both frontend and backend together on Vercel using serverless functions:
+
+1. **Build the application**:
+   ```bash
+   npm run build
+   ```
+
+2. **Deploy to Vercel**:
+   ```bash
+   npm i -g vercel
+   vercel login
+   vercel --prod
+   ```
+
+3. **Set environment variables** in Vercel Dashboard:
+   - `OPENAI_API_KEY` (required)
+   - `VITE_SUPABASE_URL` (optional)
+   - `VITE_SUPABASE_ANON_KEY` (optional)
+
+### Separate Deployment (Alternative)
+
+- **Frontend**: Vercel (static hosting)
+- **Backend**: Railway, Render, Heroku, or VPS
+
+See [DEPLOYMENT_BACKEND.md](DEPLOYMENT_BACKEND.md) for backend-only deployment.
+
+### Full Documentation
+
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** - Complete full-stack Vercel deployment guide
+- **[DEPLOYMENT_BACKEND.md](DEPLOYMENT_BACKEND.md)** - Separate backend deployment details
+
+### Environment Variables
+
+**For Full-Stack Vercel Deployment:**
+- `OPENAI_API_KEY` (required) - OpenAI API key for AI features
+- `VITE_SUPABASE_URL` (optional) - Supabase project URL
+- `VITE_SUPABASE_ANON_KEY` (optional) - Supabase anonymous key
+- `NODE_ENV=production` (optional) - Set to production
+
+**For Separate Deployment:**
+- **Frontend (Vercel)**: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_URL`
+- **Backend (Hosting platform)**: `OPENAI_API_KEY`, `NODE_ENV=production`, `PORT`
 
 ## 🤝 Contributing
 

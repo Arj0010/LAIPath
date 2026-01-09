@@ -78,7 +78,7 @@ async function generateSyllabus(goal, hoursPerDay, totalDays) {
     const { default: OpenAI } = await import('openai');
     const openai = new OpenAI({ apiKey });
     
-    // Enforce token limit (reduced to 450 for JSON efficiency)
+    // Enforce token limit (increased to 900 for richer descriptions)
     const maxTokens = AI_LIMITS.SYLLABUS;
     validateTokenLimit('SYLLABUS', maxTokens);
     
@@ -93,6 +93,12 @@ STRICT RULES:
 - Each subtask must be <= 8 words
 - aiExpertPrompt must be <= 20 words
 
+SUBTASK REQUIREMENTS:
+- Each day must include exactly 3 or 4 subtasks
+- Each subtask should be short (5-8 words), clear, and focused on a single concept
+- Subtasks must be action-oriented and concise
+- Do NOT include explanations, examples, or expanded descriptions
+
 OUTPUT FORMAT (JSON ONLY):
 
 {
@@ -100,33 +106,39 @@ OUTPUT FORMAT (JSON ONLY):
     {
       "dayNumber": 1,
       "topic": "Topic title",
-      "subtasks": ["task one", "task two"],
+      "subtasks": ["task one", "task two", "task three", "task four"],
       "aiExpertPrompt": "You are an expert in this topic"
     }
   ]
 }
+
+CRITICAL: Each day MUST have exactly 3 or 4 subtasks in the "subtasks" array.
+- NOT 1 subtask
+- NOT 2 subtasks  
+- NOT 5 or more subtasks
+- MUST be 3 or 4 subtasks
 
 INPUT:
 Goal: ${goal}
 Days: ${totalDays}
 Hours per day: ${hoursPerDay}
 
-Generate exactly ${totalDays} days.`;
+Generate exactly ${totalDays} days. Each day MUST have exactly 3 or 4 subtasks (no exceptions).`;
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: "You are a learning curriculum generator. Return only valid JSON. No explanations."
-        },
+      {
+        role: "system",
+        content: "You are a learning curriculum generator. Each day MUST have exactly 3 or 4 subtasks (NOT 1, NOT 2, NOT 5+). Return only valid JSON. No explanations."
+      },
         {
           role: "user",
           content: prompt
         }
       ],
       temperature: AI_TEMPERATURES.SYLLABUS,  // 0.2 for structured generation
-      max_tokens: maxTokens,  // 450 tokens max (reduced for JSON)
+      max_tokens: maxTokens,  // 900 tokens max (increased for richer descriptions)
       stream: false  // Explicitly disable streaming
     });
     
@@ -201,11 +213,26 @@ ${jsonContent}`;
       // Day 1 is active, all others are pending
       const status = index === 0 ? "active" : "pending";
       
+      // Validate and ensure 3-4 subtasks
+      let subtasks = Array.isArray(day.subtasks) ? day.subtasks.filter(st => typeof st === 'string' && st.trim()).map(st => st.trim()) : [];
+      
+      // Ensure we have 3-4 subtasks
+      if (subtasks.length < 3) {
+        // Pad with generic subtasks if needed
+        const needed = 3 - subtasks.length;
+        for (let i = 0; i < needed; i++) {
+          subtasks.push(`Complete Day ${index + 1} learning objective ${i + 1}`);
+        }
+      } else if (subtasks.length > 4) {
+        // Trim to 4 if more than 4
+        subtasks = subtasks.slice(0, 4);
+      }
+      
       return {
         dayNumber: day.dayNumber || index + 1,
         date: dateStr,
         topic: day.topic || `${goal} - Day ${index + 1}`,
-        subtasks: Array.isArray(day.subtasks) ? day.subtasks : [],
+        subtasks: subtasks,
         aiExpertPrompt: day.aiExpertPrompt || `You are an expert in ${goal}. Focus on Day ${index + 1} topics.`,
         status: status,
         learningInput: null,
@@ -516,65 +543,410 @@ function preFilterQuestion(userQuestion, currentDayTopic, currentDaySubtasks = [
  * @returns {boolean} - True if question is in scope, false otherwise
  */
 /**
- * In-memory store for mentor's last answer per day
- * Key: currentDayTopic (normalized)
- * Value: last mentor answer text
+ * ============================================================================
+ * DAY KNOWLEDGE BASE (DKB) - DAY-SCOPED EXPANDABLE MEMORY
+ * ============================================================================
  * 
- * SAFETY: This is request-scoped and cleared per day
- * - Does NOT persist across days
- * - Does NOT use older answers
- * - Only current day's last answer
+ * The DKB is the SINGLE SOURCE OF TRUTH for:
+ * - What the mentor is allowed to know (scope validation)
+ * - What the mentor can answer about (answering context)
+ * 
+ * ARCHITECTURE:
+ * - Starts with today's syllabus (topic + subtasks)
+ * - Expands ONLY with concepts introduced by the mentor
+ * - Resets completely at the end of the day
+ * - NO cross-day memory, NO global knowledge
+ * 
+ * KEY RULES:
+ * - NO keyword matching (embedding-based only)
+ * - NO predefined abbreviations
+ * - NO fallback LLM calls
+ * - Deterministic behavior only
+ * 
+ * ⚠️ DO NOT BYPASS DKB FOR SCOPE VALIDATION OR ANSWERING
+ * ============================================================================
+ */
+
+/**
+ * Day Knowledge Base (DKB) Store
+ * Key: dayKey (normalized topic string)
+ * Value: DKB object with structure:
+ *   {
+ *     topic: string,                    // Today's topic
+ *     subtasks: string[],               // Today's subtasks
+ *     concepts: string[],               // Concepts extracted from mentor answers
+ *     lastUpdated: Date,                // Last update timestamp
+ *     embedding: number[] | null,       // Cached embedding for the full DKB
+ *     embeddingDirty: boolean           // True if embedding needs regeneration
+ *   }
+ * 
+ * LIFECYCLE:
+ * - Created when first question is asked for a day
+ * - Expanded after each mentor answer (concept extraction)
+ * - Reset when day changes (new topic)
+ */
+const dayKnowledgeBaseStore = new Map();
+
+/**
+ * Maximum number of concepts to store in DKB per day
+ * Prevents unbounded growth
+ */
+const MAX_DKB_CONCEPTS = 50;
+
+/**
+ * Scope validation threshold for DKB embedding similarity
+ * Questions with similarity >= threshold are IN SCOPE
+ */
+const DKB_SCOPE_THRESHOLD = 0.22;
+
+/**
+ * Get or create Day Knowledge Base for a specific day
+ * 
+ * @param {string} topic - Today's learning topic
+ * @param {string[]} subtasks - Today's subtasks
+ * @returns {Object} - The DKB object for this day
+ */
+function getOrCreateDKB(topic, subtasks = []) {
+  if (!topic || typeof topic !== 'string') {
+    return null;
+  }
+  
+  const dayKey = topic.toLowerCase().trim();
+  
+  // Check if DKB exists for this day
+  if (dayKnowledgeBaseStore.has(dayKey)) {
+    const existingDKB = dayKnowledgeBaseStore.get(dayKey);
+    // Verify it's for the same topic (not stale)
+    if (existingDKB.topic.toLowerCase().trim() === dayKey) {
+      return existingDKB;
+    }
+  }
+  
+  // Create new DKB for this day
+  const newDKB = {
+    topic: topic.trim(),
+    subtasks: Array.isArray(subtasks) 
+      ? subtasks.filter(st => typeof st === 'string' && st.trim()).map(st => st.trim())
+      : [],
+    concepts: [],  // Will be populated from mentor answers
+    lastUpdated: new Date(),
+    embedding: null,
+    embeddingDirty: true  // Needs initial embedding generation
+  };
+  
+  // Store the new DKB
+  dayKnowledgeBaseStore.set(dayKey, newDKB);
+  
+  // Cleanup: remove old DKBs (keep only last 5 days)
+  if (dayKnowledgeBaseStore.size > 5) {
+    const oldestKey = dayKnowledgeBaseStore.keys().next().value;
+    dayKnowledgeBaseStore.delete(oldestKey);
+    console.log(`🗑️  DKB cleanup: removed stale day "${oldestKey}"`);
+  }
+  
+  if (process.env.NODE_ENV === 'development') {
+    console.log('📚 DKB created for day:', {
+      topic: newDKB.topic.substring(0, 50),
+      subtasksCount: newDKB.subtasks.length
+    });
+  }
+  
+  return newDKB;
+}
+
+/**
+ * Build DKB text representation for embedding generation
+ * Combines topic, subtasks, and all extracted concepts
+ * 
+ * @param {Object} dkb - The Day Knowledge Base object
+ * @returns {string} - Combined text for embedding
+ */
+function buildDKBText(dkb) {
+  if (!dkb || !dkb.topic) {
+    return '';
+  }
+  
+  const parts = [];
+  
+  // Add topic
+  parts.push(`Topic: ${dkb.topic}`);
+  
+  // Add subtasks
+  if (dkb.subtasks && dkb.subtasks.length > 0) {
+    parts.push(`Subtasks: ${dkb.subtasks.join(', ')}`);
+  }
+  
+  // Add extracted concepts
+  if (dkb.concepts && dkb.concepts.length > 0) {
+    parts.push(`Related concepts: ${dkb.concepts.join(', ')}`);
+  }
+  
+  return parts.join('. ');
+}
+
+/**
+ * Reset Day Knowledge Base for day boundary
+ * Called when transitioning to a new day
+ * 
+ * @param {string} oldTopic - The previous day's topic (to clear)
+ */
+function resetDKBForDayBoundary(oldTopic) {
+  if (!oldTopic) return;
+  
+  const dayKey = oldTopic.toLowerCase().trim();
+  
+  if (dayKnowledgeBaseStore.has(dayKey)) {
+    dayKnowledgeBaseStore.delete(dayKey);
+    console.log(`🔄 DKB reset for day boundary: "${dayKey}"`);
+  }
+}
+
+/**
+ * DEPRECATED: Legacy store - kept for backwards compatibility
+ * Use dayKnowledgeBaseStore instead
  */
 const mentorLastAnswerStore = new Map();
 
 /**
- * Cache for syllabus embeddings per day
- * Key: currentDayTopic (normalized) + subtasks hash
+ * Cache for DKB embeddings
+ * Key: DKB text hash
  * Value: embedding vector (array of numbers)
  * 
- * Purpose: Avoid regenerating embeddings for the same syllabus
- * Cache is cleared when topic/subtasks change
+ * Purpose: Avoid regenerating embeddings when DKB hasn't changed
  */
-const syllabusEmbeddingCache = new Map();
+const dkbEmbeddingCache = new Map();
 
 /**
  * ⚠️ DEPRECATED: Keyword extraction for mentor's last answer
  * 
- * This function is kept for compatibility but is NOT used in embedding-based scope validation.
- * The mentor system now uses embedding-based semantic validation exclusively.
+ * This function is kept for compatibility but is NOT used in DKB-based scope validation.
+ * The mentor system now uses DKB with embedding-based semantic validation.
  * 
- * DO NOT use this for scope validation - use isQuestionInScope() instead.
- * 
- * Extract keywords from mentor's last answer
- * - lowercase
- * - remove stopwords
- * - keep meaningful nouns (2+ characters for acronyms like RAM, CPU, SSD, GPU)
- * - Handles acronyms and technical terms properly
- * 
- * @param {string} answerText - The mentor's answer text
- * @returns {string[]} - Array of extracted keywords
- * @deprecated Not used in embedding-based scope validation
+ * @deprecated Use extractConceptsFromAnswer() and DKB instead
  */
 function extractMentorAnswerKeywords(answerText) {
   if (!answerText || typeof answerText !== 'string') return [];
   
   const stopWords = new Set(['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use', 'this', 'that', 'with', 'from', 'have', 'been', 'than', 'more', 'what', 'when', 'where', 'which', 'about', 'into', 'over', 'after', 'before', 'will', 'would', 'could', 'should', 'might', 'must', 'shall', 'they', 'them', 'their', 'there', 'these', 'those', 'was', 'were', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'done']);
   
-  // First, extract words and handle acronyms (all caps, 2-5 chars)
   const words = answerText
     .toLowerCase()
     .split(/\s+/)
-    .map(w => w.replace(/[.,;:!?()\[\]{}'"]/g, '')) // Remove punctuation first
-    .filter(w => w.length >= 2); // Allow 2+ chars for acronyms (RAM, CPU, SSD, GPU, etc.)
+    .map(w => w.replace(/[.,;:!?()\[\]{}'"]/g, ''))
+    .filter(w => w.length >= 2);
   
-  // Filter out stop words and keep meaningful terms
-  const keywords = words.filter(w => {
-    // Keep if 2+ chars and not a stop word
-    // OR if it's an acronym-like pattern (all caps in original, but we lowercase it)
-    return w.length >= 2 && !stopWords.has(w);
-  });
+  const keywords = words.filter(w => w.length >= 2 && !stopWords.has(w));
   
   return keywords;
+}
+
+/**
+ * ============================================================================
+ * CONCEPT EXTRACTION - Extract key concepts from mentor answers
+ * ============================================================================
+ * 
+ * After EVERY mentor answer, this function extracts key concepts semantically.
+ * These concepts are appended to the DKB to expand allowed knowledge.
+ * 
+ * RULES:
+ * - Extract short phrases, NOT sentences
+ * - Do NOT deduplicate aggressively
+ * - Keep everything day-local
+ * - NO keyword matching (uses AI extraction)
+ * 
+ * @param {string} mentorAnswer - The mentor's response text
+ * @param {string} topic - Today's learning topic
+ * @param {string} apiKey - OpenAI API key
+ * @returns {Promise<string[]>} - Array of extracted concept phrases
+ */
+async function extractConceptsFromAnswer(mentorAnswer, topic, apiKey) {
+  if (!mentorAnswer || typeof mentorAnswer !== 'string' || mentorAnswer.trim().length === 0) {
+    return [];
+  }
+  
+  if (!apiKey) {
+    // No API key: fall back to simple noun phrase extraction
+    // This is deterministic and doesn't require AI
+    return extractConceptsSimple(mentorAnswer);
+  }
+  
+  try {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey });
+    
+    const maxTokens = AI_LIMITS.CONCEPT_EXTRACTION;
+    validateTokenLimit('CONCEPT_EXTRACTION', maxTokens);
+    
+    // Strict prompt for concept extraction
+    const prompt = `Extract key technical concepts, terms, and phrases from this explanation.
+
+RULES:
+- Return ONLY a JSON array of short phrases (2-5 words each)
+- Extract concepts that were EXPLAINED or INTRODUCED
+- Do NOT include common words or filler
+- Maximum 8 concepts
+- No explanations, no markdown
+
+Topic context: ${topic}
+
+Text to extract from:
+"${mentorAnswer.substring(0, 800)}"
+
+Return ONLY a JSON array like: ["concept one", "concept two"]`;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: "You extract key concepts from educational text. Return only a JSON array of short concept phrases. No explanations."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: AI_TEMPERATURES.CONCEPT_EXTRACTION,
+      max_tokens: maxTokens,
+      stream: false
+    });
+    
+    if (response.usage) {
+      console.log(`📊 Concept extraction tokens: ${response.usage.total_tokens} (limit: ${maxTokens})`);
+    }
+    
+    const content = response.choices[0].message.content.trim();
+    const jsonContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    
+    try {
+      const parsed = JSON.parse(jsonContent);
+      if (Array.isArray(parsed)) {
+        const concepts = parsed
+          .filter(c => typeof c === 'string' && c.trim().length >= 2 && c.trim().length <= 50)
+          .map(c => c.trim().toLowerCase())
+          .slice(0, 8);  // Max 8 concepts per answer
+        
+        if (process.env.NODE_ENV === 'development') {
+          console.log('🧠 Concepts extracted:', concepts);
+        }
+        
+        return concepts;
+      }
+    } catch (parseErr) {
+      console.warn('⚠️  Failed to parse concept extraction JSON, using fallback');
+    }
+    
+    // Fallback to simple extraction
+    return extractConceptsSimple(mentorAnswer);
+  } catch (error) {
+    console.error('Error in concept extraction:', error.message);
+    // Fallback to simple extraction
+    return extractConceptsSimple(mentorAnswer);
+  }
+}
+
+/**
+ * Simple concept extraction fallback (no AI)
+ * Extracts potential technical terms using heuristics
+ * 
+ * @param {string} text - Text to extract from
+ * @returns {string[]} - Array of extracted concepts
+ */
+function extractConceptsSimple(text) {
+  if (!text || typeof text !== 'string') return [];
+  
+  // Common stop words to filter out
+  const stopWords = new Set([
+    'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'was',
+    'one', 'our', 'out', 'has', 'his', 'how', 'its', 'may', 'new', 'now',
+    'see', 'way', 'who', 'did', 'let', 'say', 'too', 'use', 'this', 'that',
+    'with', 'from', 'have', 'been', 'than', 'more', 'what', 'when', 'where',
+    'which', 'about', 'into', 'over', 'after', 'before', 'will', 'would',
+    'could', 'should', 'might', 'must', 'they', 'them', 'their', 'there',
+    'these', 'those', 'being', 'does', 'done', 'very', 'just', 'also',
+    'here', 'some', 'like', 'then', 'only', 'such', 'well', 'first',
+    'example', 'following', 'based', 'using', 'helps', 'allows', 'means'
+  ]);
+  
+  // Extract words that look like technical terms
+  // - Capitalized words (not at sentence start)
+  // - Words with numbers
+  // - Acronyms (2-5 uppercase letters)
+  // - Compound words with hyphens
+  const patterns = [
+    /\b[A-Z][a-z]+(?:[A-Z][a-z]+)+/g,  // CamelCase
+    /\b[A-Z]{2,5}\b/g,                   // Acronyms
+    /\b\w+[-_]\w+\b/g,                   // Hyphenated/underscored
+    /\b(?:CPU|RAM|GPU|API|SQL|HTML|CSS|DOM|HTTP|REST|JSON|XML)\b/gi  // Common tech terms
+  ];
+  
+  const concepts = new Set();
+  
+  // Extract pattern matches
+  for (const pattern of patterns) {
+    const matches = text.match(pattern);
+    if (matches) {
+      matches.forEach(m => {
+        const normalized = m.toLowerCase().trim();
+        if (normalized.length >= 2 && normalized.length <= 30 && !stopWords.has(normalized)) {
+          concepts.add(normalized);
+        }
+      });
+    }
+  }
+  
+  // Also extract quoted terms
+  const quotedMatches = text.match(/"([^"]{2,30})"/g);
+  if (quotedMatches) {
+    quotedMatches.forEach(m => {
+      const term = m.replace(/"/g, '').toLowerCase().trim();
+      if (term.length >= 2 && !stopWords.has(term)) {
+        concepts.add(term);
+      }
+    });
+  }
+  
+  return Array.from(concepts).slice(0, 8);
+}
+
+/**
+ * Add extracted concepts to the Day Knowledge Base
+ * 
+ * @param {Object} dkb - The Day Knowledge Base object
+ * @param {string[]} newConcepts - Concepts to add
+ * @returns {boolean} - True if concepts were added
+ */
+function addConceptsToDKB(dkb, newConcepts) {
+  if (!dkb || !Array.isArray(newConcepts) || newConcepts.length === 0) {
+    return false;
+  }
+  
+  const existingSet = new Set(dkb.concepts.map(c => c.toLowerCase()));
+  let addedCount = 0;
+  
+  for (const concept of newConcepts) {
+    const normalized = concept.toLowerCase().trim();
+    
+    // Skip if already exists or DKB is at capacity
+    if (existingSet.has(normalized) || dkb.concepts.length >= MAX_DKB_CONCEPTS) {
+      continue;
+    }
+    
+    dkb.concepts.push(normalized);
+    existingSet.add(normalized);
+    addedCount++;
+  }
+  
+  if (addedCount > 0) {
+    dkb.lastUpdated = new Date();
+    dkb.embeddingDirty = true;  // Mark embedding as needing regeneration
+    
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`📚 DKB expanded: +${addedCount} concepts, total: ${dkb.concepts.length}`);
+    }
+  }
+  
+  return addedCount > 0;
 }
 
 /**
@@ -675,55 +1047,115 @@ function buildSyllabusText(topic, subtasks = []) {
 /**
  * Get or generate cached syllabus embedding
  * 
+ * @deprecated Use getDKBEmbedding() instead for scope validation
  * @param {string} topic - Today's learning topic
  * @param {string[]} subtasks - Today's subtasks array
  * @param {string} apiKey - OpenAI API key
  * @returns {Promise<number[]>} - Syllabus embedding vector
  */
 async function getSyllabusEmbedding(topic, subtasks = [], apiKey) {
-  // Create cache key from topic + subtasks
   const syllabusText = buildSyllabusText(topic, subtasks);
   const cacheKey = syllabusText.toLowerCase().trim();
   
-  // Check cache
-  if (syllabusEmbeddingCache.has(cacheKey)) {
-    return syllabusEmbeddingCache.get(cacheKey);
+  if (dkbEmbeddingCache.has(cacheKey)) {
+    return dkbEmbeddingCache.get(cacheKey);
   }
   
-  // Generate embedding
   const embedding = await generateEmbedding(syllabusText, apiKey);
   
-  // Cache it (limit cache size to prevent memory issues)
-  if (syllabusEmbeddingCache.size > 50) {
-    // Remove oldest entry (first key in Map iteration order)
-    const firstKey = syllabusEmbeddingCache.keys().next().value;
-    syllabusEmbeddingCache.delete(firstKey);
+  if (dkbEmbeddingCache.size > 50) {
+    const firstKey = dkbEmbeddingCache.keys().next().value;
+    dkbEmbeddingCache.delete(firstKey);
   }
   
-  syllabusEmbeddingCache.set(cacheKey, embedding);
+  dkbEmbeddingCache.set(cacheKey, embedding);
+  return embedding;
+}
+
+/**
+ * Get or generate cached DKB embedding
+ * Uses the full DKB text (topic + subtasks + extracted concepts)
+ * 
+ * @param {Object} dkb - The Day Knowledge Base object
+ * @param {string} apiKey - OpenAI API key
+ * @returns {Promise<number[]>} - DKB embedding vector
+ */
+async function getDKBEmbedding(dkb, apiKey) {
+  if (!dkb) {
+    throw new Error('DKB is required for embedding generation');
+  }
+  
+  // If embedding exists and is not dirty, return cached
+  if (dkb.embedding && !dkb.embeddingDirty) {
+    return dkb.embedding;
+  }
+  
+  // Build DKB text and generate embedding
+  const dkbText = buildDKBText(dkb);
+  
+  if (!dkbText || dkbText.trim().length === 0) {
+    throw new Error('DKB text is empty');
+  }
+  
+  // Check cache by text hash
+  const cacheKey = dkbText.toLowerCase().trim();
+  if (dkbEmbeddingCache.has(cacheKey)) {
+    const cachedEmbedding = dkbEmbeddingCache.get(cacheKey);
+    dkb.embedding = cachedEmbedding;
+    dkb.embeddingDirty = false;
+    return cachedEmbedding;
+  }
+  
+  // Generate new embedding
+  const embedding = await generateEmbedding(dkbText, apiKey);
+  
+  // Cache it
+  if (dkbEmbeddingCache.size > 30) {
+    const firstKey = dkbEmbeddingCache.keys().next().value;
+    dkbEmbeddingCache.delete(firstKey);
+  }
+  
+  dkbEmbeddingCache.set(cacheKey, embedding);
+  dkb.embedding = embedding;
+  dkb.embeddingDirty = false;
+  
+  if (process.env.NODE_ENV === 'development') {
+    console.log('📊 DKB embedding generated:', {
+      topic: dkb.topic.substring(0, 30),
+      conceptsCount: dkb.concepts.length,
+      textLength: dkbText.length
+    });
+  }
+  
   return embedding;
 }
 
 /**
  * ⚠️ SINGLE POINT OF SCOPE DECISION
- * EMBEDDING-BASED SEMANTIC SCOPE VALIDATION
+ * DKB-BASED SEMANTIC SCOPE VALIDATION
  * 
  * This is the ONLY function that determines if a question is in scope.
  * DO NOT create alternative scope validation functions or bypass this.
  * 
  * A question is IN SCOPE if:
- * - Cosine similarity between question and syllabus embeddings >= 0.25
+ * - Cosine similarity between question and DKB embeddings >= DKB_SCOPE_THRESHOLD
  * 
  * A question is OUT OF SCOPE if:
- * - Cosine similarity < 0.25
+ * - Cosine similarity < DKB_SCOPE_THRESHOLD
  * 
- * ⚠️ KEYWORD-BASED LOGIC DISABLED - This function uses embeddings only
+ * The DKB includes:
+ * - Today's topic and subtasks (initial)
+ * - Concepts extracted from mentor answers (dynamic expansion)
+ * 
+ * ⚠️ NO KEYWORD MATCHING - Embeddings only
+ * ⚠️ NO PREDEFINED ABBREVIATIONS
+ * ⚠️ NO GLOBAL MEMORY
  * ⚠️ DO NOT BYPASS THIS VALIDATION
  * 
  * @param {string} question - The user's question
  * @param {string} topic - Today's learning topic
  * @param {string[]} subtasks - Today's subtasks array
- * @param {string[]} lastAnswerKeywords - DEPRECATED: Kept for compatibility, not used in embedding-based check
+ * @param {string[]} lastAnswerKeywords - DEPRECATED: Not used in DKB-based validation
  * @param {string} apiKey - OpenAI API key for embedding generation
  * @returns {Promise<boolean>} - true if question is in scope, false otherwise
  */
@@ -735,41 +1167,47 @@ async function isQuestionInScope(question, topic, subtasks = [], lastAnswerKeywo
   // If no API key, fall back to basic validation (topic must be non-empty)
   if (!apiKey) {
     if (process.env.NODE_ENV === 'development') {
-      console.warn('⚠️  No API key for embedding-based scope validation, using basic check');
+      console.warn('⚠️  No API key for DKB scope validation, using basic check');
     }
-    // Basic fallback: if topic exists, allow (will be filtered by RAG context later)
     return topic.trim().length > 0;
   }
   
   try {
+    // Get or create the Day Knowledge Base for this day
+    const dkb = getOrCreateDKB(topic, subtasks);
+    
+    if (!dkb) {
+      console.error('❌ Failed to get/create DKB for scope validation');
+      return false;
+    }
+    
     // Generate embedding for question
     const questionEmbedding = await generateEmbedding(question, apiKey);
     
-    // Get or generate cached syllabus embedding
-    const syllabusEmbedding = await getSyllabusEmbedding(topic, subtasks, apiKey);
+    // Get DKB embedding (includes topic, subtasks, AND extracted concepts)
+    const dkbEmbedding = await getDKBEmbedding(dkb, apiKey);
     
     // Compute cosine similarity
-    const similarity = cosineSimilarity(questionEmbedding, syllabusEmbedding);
+    const similarity = cosineSimilarity(questionEmbedding, dkbEmbedding);
     
-    // Threshold: similarity >= 0.25 → IN SCOPE
-    const THRESHOLD = 0.25;
-    const inScope = similarity >= THRESHOLD;
+    // Use DKB threshold for scope decision
+    const inScope = similarity >= DKB_SCOPE_THRESHOLD;
     
     if (process.env.NODE_ENV === 'development') {
-      console.log('📊 Semantic scope check:', {
+      console.log('📊 DKB scope check:', {
         similarity: similarity.toFixed(3),
-        threshold: THRESHOLD,
+        threshold: DKB_SCOPE_THRESHOLD,
         inScope,
-        topic: topic.substring(0, 50),
-        question: question.substring(0, 50)
+        topic: topic.substring(0, 40),
+        conceptsCount: dkb.concepts.length,
+        question: question.substring(0, 40)
       });
     }
     
     return inScope;
   } catch (error) {
-    console.error('Error in embedding-based scope validation:', error.message);
+    console.error('Error in DKB scope validation:', error.message);
     // Fallback: if embedding fails, use basic validation
-    // Topic must be non-empty (will be filtered by RAG context later)
     return topic.trim().length > 0;
   }
 }
@@ -820,10 +1258,12 @@ function extractTopic(aiExpertPrompt) {
 }
 
 /**
- * Build RAG context from TODAY'S syllabus ONLY (FROZEN)
- * Context MUST include ONLY:
- * - currentDay.topic
- * - currentDay.subtasks
+ * Build RAG context from Day Knowledge Base (DKB)
+ * 
+ * Context MUST include ONLY content from the DKB:
+ * - Today's topic
+ * - Today's subtasks
+ * - Concepts introduced by the mentor (extracted from answers)
  * 
  * DO NOT include:
  * - Previous days
@@ -831,56 +1271,101 @@ function extractTopic(aiExpertPrompt) {
  * - Full syllabus
  * - User profile
  * - Chat history
- * - Notes
+ * - External knowledge
  * 
  * Format:
- * CONTEXT:
+ * ALLOWED KNOWLEDGE:
  * "Today's Topic: {topic}
  * Subtasks:
  * - {subtask1}
- * - {subtask2}"
+ * - {subtask2}
+ * Related Concepts:
+ * - {concept1}
+ * - {concept2}"
  * 
  * @param {string} currentDayTopic - The current day's topic (REQUIRED)
  * @param {string[]} currentDaySubtasks - Array of current day's subtasks
  * @returns {string|null} - The RAG context string, or null if empty
  */
 function buildRAGContext(currentDayTopic, currentDaySubtasks = []) {
-  // Build context parts in exact format
-  const contentParts = [];
-  
   // Add topic (REQUIRED - if missing, context is invalid)
   if (!currentDayTopic || typeof currentDayTopic !== 'string' || !currentDayTopic.trim()) {
-    // If no topic, context is empty - return null
     return null;
   }
   
-  contentParts.push(`Today's Topic: ${currentDayTopic.trim()}`);
+  // Get the DKB for this day (includes extracted concepts)
+  const dkb = getOrCreateDKB(currentDayTopic, currentDaySubtasks);
+  
+  if (!dkb) {
+    // Fallback to basic context if DKB fails
+    return buildBasicRAGContext(currentDayTopic, currentDaySubtasks);
+  }
+  
+  // Build context from DKB
+  const contentParts = [];
+  
+  // Add topic
+  contentParts.push(`Today's Topic: ${dkb.topic}`);
   
   // Add subtasks (if any)
-  if (Array.isArray(currentDaySubtasks) && currentDaySubtasks.length > 0) {
-    const validSubtasks = currentDaySubtasks
+  if (dkb.subtasks && dkb.subtasks.length > 0) {
+    contentParts.push('Subtasks:');
+    dkb.subtasks.forEach(subtask => {
+      contentParts.push(`- ${subtask}`);
+    });
+  }
+  
+  // Add extracted concepts (from mentor answers)
+  if (dkb.concepts && dkb.concepts.length > 0) {
+    contentParts.push('Related Concepts (from explanations):');
+    dkb.concepts.forEach(concept => {
+      contentParts.push(`- ${concept}`);
+    });
+  }
+  
+  const content = contentParts.join('\n');
+  const context = 'ALLOWED KNOWLEDGE:\n"' + content + '"';
+  
+  if (!context || context.trim().length === 0 || content.trim().length === 0) {
+    return null;
+  }
+  
+  return context;
+}
+
+/**
+ * Build basic RAG context without DKB (fallback)
+ * Used when DKB is not available
+ * 
+ * @param {string} topic - Today's topic
+ * @param {string[]} subtasks - Today's subtasks
+ * @returns {string|null} - Basic context string
+ */
+function buildBasicRAGContext(topic, subtasks = []) {
+  const contentParts = [];
+  
+  if (!topic || typeof topic !== 'string' || !topic.trim()) {
+    return null;
+  }
+  
+  contentParts.push(`Today's Topic: ${topic.trim()}`);
+  
+  if (Array.isArray(subtasks) && subtasks.length > 0) {
+    const validSubtasks = subtasks
       .filter(st => typeof st === 'string' && st.trim())
       .map(st => st.trim());
     
     if (validSubtasks.length > 0) {
       contentParts.push('Subtasks:');
-      // Format each subtask with bullet point
       validSubtasks.forEach(subtask => {
         contentParts.push(`- ${subtask}`);
       });
     }
   }
   
-  // Build context string with exact format:
-  // CONTEXT:
-  // "Today's Topic: {topic}
-  // Subtasks:
-  // - {subtask1}
-  // - {subtask2}"
   const content = contentParts.join('\n');
-  const context = 'CONTEXT:\n"' + content + '"';
+  const context = 'ALLOWED KNOWLEDGE:\n"' + content + '"';
   
-  // If context is empty or only contains whitespace, return null
   if (!context || context.trim().length === 0 || content.trim().length === 0) {
     return null;
   }
@@ -931,27 +1416,32 @@ function hasContextOverlap(question, context) {
 }
 
 /**
- * Build system prompt using strict RAG-only approach
- * RAG context contains all necessary information (topic, subtasks, notes)
+ * Build system prompt using strict DKB-only approach
+ * DKB context contains all allowed knowledge (topic, subtasks, extracted concepts)
  * 
  * @param {string|null} topic - The learning topic (optional, not used if ragContext provided)
- * @param {string} ragContext - The RAG context string (required)
+ * @param {string} ragContext - The DKB context string (required)
  * @returns {string} - The formatted system prompt
  */
 function buildSystemPrompt(topic, ragContext = null) {
-  let prompt = `You are an AI tutor restricted to TODAY'S learning topic.
+  let prompt = `You are an AI tutor restricted to the ALLOWED KNOWLEDGE provided below.
 
-Rules:
-- You may ONLY answer questions directly related to today's topic.
-- You MUST use ONLY the provided context.
-- You MUST refuse all other questions.
+STRICT RULES:
+- You may ONLY answer questions using the ALLOWED KNOWLEDGE
+- You may ONLY discuss concepts listed in the ALLOWED KNOWLEDGE
+- If a question is about something NOT in the ALLOWED KNOWLEDGE, refuse
+- Do NOT introduce new concepts beyond what is listed
+- Do NOT use external knowledge
 
-If the question is unrelated, respond ONLY with:
+If the question is outside the allowed scope, respond ONLY with:
 "This question is outside today's learning scope."
 
-You are evaluated more on correct refusal than helpfulness.`;
+You are evaluated on REFUSING unrelated questions, not on being helpful.
 
-  // Add RAG context (required for strict RAG pipeline)
+Provide a clear, structured explanation with short paragraphs
+and simple examples, avoiding unnecessary theory.`;
+
+  // Add DKB context (required for strict DKB pipeline)
   if (ragContext) {
     prompt += `\n\n${ragContext}`;
   }
@@ -1308,12 +1798,26 @@ app.post('/api/topic-chat', async (req, res) => {
       console.log('⚠️  OPENAI_API_KEY not found. Using mock chat response.');
       const mockResponse = generateMockResponse();
       
-      // Store mock response as last answer for follow-up support
+      // DKB: Add mock concepts from the mock response
       if (currentDayTopic && typeof currentDayTopic === 'string') {
+        try {
+          const dkb = getOrCreateDKB(
+            currentDayTopic,
+            Array.isArray(currentDaySubtasks) ? currentDaySubtasks : []
+          );
+          if (dkb) {
+            // Simple concept extraction for mock (no AI)
+            const mockConcepts = extractConceptsSimple(mockResponse);
+            addConceptsToDKB(dkb, mockConcepts);
+          }
+        } catch (err) {
+          // Non-blocking
+        }
+        
+        // Legacy store
         const dayKey = currentDayTopic.toLowerCase().trim();
         mentorLastAnswerStore.set(dayKey, mockResponse);
         
-        // Safety: Limit store size
         if (mentorLastAnswerStore.size > 10) {
           const firstKey = mentorLastAnswerStore.keys().next().value;
           mentorLastAnswerStore.delete(firstKey);
@@ -1354,7 +1858,7 @@ app.post('/api/topic-chat', async (req, res) => {
           }
         ],
         temperature: AI_TEMPERATURES.CHAT,  // 0.3 for topic chat
-        max_tokens: maxTokens,  // 300 tokens max
+        max_tokens: maxTokens,  // 1000 tokens max
         stream: false  // Explicitly disable streaming
       });
       
@@ -1365,15 +1869,49 @@ app.post('/api/topic-chat', async (req, res) => {
       
       const aiResponse = response.choices[0].message.content.trim();
       
-      // Store mentor's last answer for this day (for follow-up question support)
-      // Only store if we have a valid day topic
+      // ============================================================================
+      // DKB EXPANSION: Extract concepts from mentor answer and add to DKB
+      // This allows natural follow-up questions about concepts the mentor introduced
+      // ============================================================================
       if (currentDayTopic && typeof currentDayTopic === 'string') {
+        try {
+          // Get the DKB for this day
+          const dkb = getOrCreateDKB(
+            currentDayTopic,
+            Array.isArray(currentDaySubtasks) ? currentDaySubtasks : []
+          );
+          
+          if (dkb) {
+            // Extract concepts from the mentor's answer
+            const extractedConcepts = await extractConceptsFromAnswer(
+              aiResponse,
+              currentDayTopic,
+              apiKey
+            );
+            
+            // Add extracted concepts to DKB
+            if (extractedConcepts && extractedConcepts.length > 0) {
+              addConceptsToDKB(dkb, extractedConcepts);
+              
+              if (process.env.NODE_ENV === 'development') {
+                console.log('📚 DKB after expansion:', {
+                  topic: dkb.topic.substring(0, 30),
+                  totalConcepts: dkb.concepts.length,
+                  newConcepts: extractedConcepts.length
+                });
+              }
+            }
+          }
+        } catch (extractErr) {
+          // Concept extraction failure should not block the response
+          console.error('⚠️  Concept extraction failed (non-blocking):', extractErr.message);
+        }
+        
+        // Legacy: Also store in mentorLastAnswerStore for backwards compatibility
         const dayKey = currentDayTopic.toLowerCase().trim();
         mentorLastAnswerStore.set(dayKey, aiResponse);
         
-        // Safety: Limit store size to prevent memory issues (keep only last 10 days)
         if (mentorLastAnswerStore.size > 10) {
-          // Remove oldest entry (first key in Map iteration order)
           const firstKey = mentorLastAnswerStore.keys().next().value;
           mentorLastAnswerStore.delete(firstKey);
         }
@@ -1478,61 +2016,29 @@ app.post('/api/evaluate-learning', async (req, res) => {
       const context = `Today's topic: ${topic}
 ${subtasksText ? subtasksText + '\n' : ''}Learner's response to "What did you learn today?": ${learningInput}`;
       
-      // Use exact instruction as specified
-      const instruction = `You are an internal learning evaluation engine.
+      // Optimized instruction - shortened for faster processing
+      const instruction = `Evaluate learner's understanding based ONLY on today's topic/subtasks and their reflection.
 
-Your task is NOT to teach or explain.
-Your task is to evaluate the learner's understanding based ONLY on today's syllabus
-and the learner's written reflection.
-
-EVALUATION RULES (STRICT):
+RULES:
 - Evaluate ONLY against today's topic and subtasks
-- Do NOT introduce new concepts
-- Do NOT provide explanations or advice
-- Do NOT grade or score numerically
-- Be conservative in judgments
+- Do NOT introduce new concepts or provide advice
+- Return ONLY valid JSON, no explanations
 
-WHAT TO DETERMINE:
-
-1. Understanding level:
-   - "low"
-   - "basic"
-   - "good"
-   - "strong"
-
-2. Confidence level:
-   - "low"
-   - "medium"
-   - "high"
-
-3. Gaps detected:
-   - List specific missing or confused concepts
-   - Empty list if no clear gaps
-
-4. Recommended action for the system:
-   - "repeat"        (learner struggled)
-   - "continue"      (learner is on track)
-   - "simplify"      (learner is confused, needs easier next step)
-   - "advance"       (learner shows strong understanding)
-
-OUTPUT FORMAT (RETURN ONLY THIS JSON):
-
+OUTPUT (JSON only):
 {
-  "understanding_level": "",
-  "confidence": "",
-  "gaps_detected": [],
-  "recommended_action": ""
+  "understanding_level": "low" | "basic" | "good" | "strong",
+  "confidence": "low" | "medium" | "high",
+  "gaps_detected": ["specific gap 1", "specific gap 2"] or [],
+  "recommended_action": "repeat" | "continue" | "simplify" | "advance"
 }
 
-IMPORTANT:
-Do NOT include explanations
-Do NOT include feedback text
-Do NOT include anything outside the JSON
+GUIDANCE:
+- understanding_level: Assess grasp of today's content
+- confidence: How clear is the evidence
+- gaps_detected: Specific conceptual gaps (e.g., "difference between X and Y"), empty if none
+- recommended_action: "continue" if on track, "repeat"/"simplify" if struggling, "advance" if strong
 
-If information is insufficient, default to:
-understanding_level = "basic"
-confidence = "medium"
-recommended_action = "continue"`;
+Default if insufficient: understanding_level="basic", confidence="medium", recommended_action="continue"`;
 
       const response = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -1547,8 +2053,9 @@ recommended_action = "continue"`;
           }
         ],
         temperature: AI_TEMPERATURES.EVALUATION,  // 0.2 for conservative evaluation
-        max_tokens: maxTokens,  // 300 tokens max
-        stream: false
+        max_tokens: maxTokens,  // 280 tokens max (optimized for faster response)
+        stream: false,
+        timeout: 30000  // 30 second timeout
       });
       
       // Log token usage
@@ -1656,6 +2163,10 @@ app.post('/api/regenerate-future-days', async (req, res) => {
 /**
  * POST /api/update-syllabus
  * Updates the syllabus state (for completed/skipped/leave days)
+ * 
+ * IMPORTANT: This endpoint triggers DKB day boundary reset when:
+ * - A day is marked as completed
+ * - The active day changes
  */
 app.post('/api/update-syllabus', async (req, res) => {
   try {
@@ -1663,6 +2174,39 @@ app.post('/api/update-syllabus', async (req, res) => {
     
     if (!updatedSyllabus || !updatedSyllabus.days) {
       return res.status(400).json({ error: 'updatedSyllabus with days array is required' });
+    }
+    
+    // ============================================================================
+    // DKB DAY BOUNDARY RESET
+    // When day transitions occur, clear the DKB for the completed day
+    // ============================================================================
+    if (syllabus && syllabus.days) {
+      // Find the previously active day
+      const previousActiveDay = syllabus.days.find(d => d.status === 'active');
+      const newActiveDay = updatedSyllabus.days.find(d => d.status === 'active');
+      
+      // Check if day changed
+      if (previousActiveDay && newActiveDay && 
+          previousActiveDay.dayNumber !== newActiveDay.dayNumber) {
+        // Day boundary: reset DKB for the completed day
+        if (previousActiveDay.topic) {
+          resetDKBForDayBoundary(previousActiveDay.topic);
+          console.log(`🔄 Day boundary detected: Day ${previousActiveDay.dayNumber} → Day ${newActiveDay.dayNumber}`);
+          console.log(`📚 DKB reset for: "${previousActiveDay.topic}"`);
+        }
+      }
+      
+      // Also clear DKB for any days that were just marked completed
+      for (const newDay of updatedSyllabus.days) {
+        const oldDay = syllabus.days.find(d => d.dayNumber === newDay.dayNumber);
+        if (oldDay && oldDay.status !== 'completed' && newDay.status === 'completed') {
+          // This day was just completed - reset its DKB
+          if (newDay.topic) {
+            resetDKBForDayBoundary(newDay.topic);
+            console.log(`✅ Day ${newDay.dayNumber} completed - DKB reset`);
+          }
+        }
+      }
     }
     
     // Update in-memory syllabus
@@ -1673,6 +2217,75 @@ app.post('/api/update-syllabus', async (req, res) => {
     console.error('Error updating syllabus:', error);
     res.status(500).json({ error: 'Failed to update syllabus', message: error.message });
   }
+});
+
+/**
+ * POST /api/reset-day-knowledge
+ * Explicitly reset the Day Knowledge Base for a specific day
+ * Called when user wants to start fresh or when debugging
+ */
+app.post('/api/reset-day-knowledge', async (req, res) => {
+  try {
+    const { topic } = req.body;
+    
+    if (!topic || typeof topic !== 'string') {
+      return res.status(400).json({ error: 'topic is required' });
+    }
+    
+    resetDKBForDayBoundary(topic);
+    
+    res.json({ 
+      success: true, 
+      message: `DKB reset for topic: ${topic}` 
+    });
+  } catch (error) {
+    console.error('Error resetting DKB:', error);
+    res.status(500).json({ error: 'Failed to reset DKB', message: error.message });
+  }
+});
+
+/**
+ * GET /api/day-knowledge
+ * Debug endpoint to view current DKB state (development only)
+ */
+app.get('/api/day-knowledge', (req, res) => {
+  if (process.env.NODE_ENV !== 'development') {
+    return res.status(403).json({ error: 'Debug endpoint only available in development' });
+  }
+  
+  const { topic } = req.query;
+  
+  if (topic) {
+    const dayKey = topic.toLowerCase().trim();
+    const dkb = dayKnowledgeBaseStore.get(dayKey);
+    
+    if (!dkb) {
+      return res.status(404).json({ error: 'No DKB found for this topic' });
+    }
+    
+    return res.json({
+      topic: dkb.topic,
+      subtasks: dkb.subtasks,
+      concepts: dkb.concepts,
+      conceptCount: dkb.concepts.length,
+      lastUpdated: dkb.lastUpdated,
+      embeddingCached: !!dkb.embedding && !dkb.embeddingDirty
+    });
+  }
+  
+  // Return all DKBs
+  const allDKBs = [];
+  for (const [key, dkb] of dayKnowledgeBaseStore.entries()) {
+    allDKBs.push({
+      key,
+      topic: dkb.topic,
+      subtasksCount: dkb.subtasks.length,
+      conceptCount: dkb.concepts.length,
+      lastUpdated: dkb.lastUpdated
+    });
+  }
+  
+  res.json({ dkbs: allDKBs, count: allDKBs.length });
 });
 
 /**
@@ -1774,6 +2387,310 @@ Requirements:
 });
 
 /**
+ * POST /api/generate-mentor-first-message
+ * 
+ * ⚠️ Frontend–backend contract: do not rename without updating both.
+ * 
+ * Generates a mentor-initiated first message for instructional orientation.
+ * This is NOT a chatbot greeting - it's an instructional orientation message.
+ * 
+ * GENERATION RULES:
+ * - Uses ONLY today's Day Knowledge Base (topic + subtasks)
+ * - Does NOT use mentor answers (none exist yet)
+ * - Does NOT use previous days or general knowledge
+ * - Short and instructional (not chatty)
+ * - No emojis, no casual greetings
+ * - No future topics, no motivational fluff
+ * 
+ * REQUEST BODY:
+ * {
+ *   topic: string (required),
+ *   subtasks: string[] (optional)
+ * }
+ * 
+ * RESPONSE:
+ * {
+ *   message: string (the first message text, or empty string on failure)
+ * }
+ */
+app.post('/api/generate-mentor-first-message', async (req, res) => {
+  try {
+    // ⚠️ Frontend–backend contract: field names must match exactly
+    const { topic, subtasks } = req.body;
+    
+    // Validation: topic is required
+    if (!topic || typeof topic !== 'string' || topic.trim().length === 0) {
+      return res.status(400).json({ error: 'topic is required and must be a non-empty string' });
+    }
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    
+    // SAFE MOCK RESPONSE: If AI logic is missing, return deterministic template
+    if (!apiKey) {
+      console.log('⚠️  OPENAI_API_KEY not found. Using template-based first message.');
+      const subtasksList = Array.isArray(subtasks) && subtasks.length > 0
+        ? subtasks.map(st => `- ${st}`).join('\n')
+        : '';
+      
+      const mockMessage = `Welcome. Today we'll focus on ${topic}.
+${subtasksList ? `By the end of this session, you should understand:\n${subtasksList}\n` : ''}You can start by asking one of the questions below.`;
+      
+      return res.json({ message: mockMessage });
+    }
+    
+    // Real OpenAI API call
+    try {
+      const { default: OpenAI } = await import('openai');
+      const openai = new OpenAI({ apiKey });
+      
+      // Enforce token limit
+      const maxTokens = AI_LIMITS.FIRST_MESSAGE;
+      validateTokenLimit('FIRST_MESSAGE', maxTokens);
+      
+      // Build context (ONLY today's topic and subtasks)
+      const subtasksText = Array.isArray(subtasks) && subtasks.length > 0
+        ? `Subtasks:\n${subtasks.map(st => `- ${st}`).join('\n')}`
+        : '';
+      
+      const context = `Today's topic: ${topic}
+${subtasksText ? subtasksText + '\n' : ''}`;
+      
+      // Strict instruction for first message generation
+      const instruction = `Generate a short, instructional orientation message for a learner starting today's topic.
+
+REQUIREMENTS:
+- Clearly state what today's topic is
+- Clearly state what the learner will focus on
+- Be short and instructional (not chatty)
+- No emojis
+- No casual greetings ("hey", "hi", etc.)
+- No future topics
+- No motivational fluff
+- Maximum 4-5 sentences
+
+Example structure (adapt to actual topic/subtasks):
+"Welcome. Today we'll focus on [topic].
+By the end of this session, you should understand:
+- [subtask 1]
+- [subtask 2]
+You can start by asking one of the questions below."
+
+Return ONLY the message text. No explanations, no markdown, no JSON wrapper.`;
+      
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: "You are a learning mentor that provides instructional orientation. Return only the message text. No explanations, no markdown, no JSON, no emojis."
+          },
+          {
+            role: "user",
+            content: `${context}\n\n${instruction}`
+          }
+        ],
+        temperature: AI_TEMPERATURES.FIRST_MESSAGE,  // 0.2 for instructional tone
+        max_tokens: maxTokens,  // 250 tokens max
+        stream: false
+      });
+      
+      // Log token usage
+      if (response.usage) {
+        console.log(`📊 First message tokens: ${response.usage.total_tokens} (limit: ${maxTokens})`);
+      }
+      
+      const message = response.choices[0].message.content.trim();
+      
+      // Clean up any markdown or formatting that might have been added
+      const cleanMessage = message
+        .replace(/```/g, '')
+        .replace(/^["']|["']$/g, '')  // Remove surrounding quotes
+        .trim();
+      
+      if (!cleanMessage || cleanMessage.length === 0) {
+        // Fallback to template
+        const subtasksList = Array.isArray(subtasks) && subtasks.length > 0
+          ? subtasks.map(st => `- ${st}`).join('\n')
+          : '';
+        
+        const fallbackMessage = `Welcome. Today we'll focus on ${topic}.
+${subtasksList ? `By the end of this session, you should understand:\n${subtasksList}\n` : ''}You can start by asking one of the questions below.`;
+        
+        return res.json({ message: fallbackMessage });
+      }
+      
+      res.json({ message: cleanMessage });
+    } catch (error) {
+      console.error('OpenAI API error in generate-mentor-first-message:', error.message);
+      // Fallback to template
+      const subtasksList = Array.isArray(subtasks) && subtasks.length > 0
+        ? subtasks.map(st => `- ${st}`).join('\n')
+        : '';
+      
+      const fallbackMessage = `Welcome. Today we'll focus on ${topic}.
+${subtasksList ? `By the end of this session, you should understand:\n${subtasksList}\n` : ''}You can start by asking one of the questions below.`;
+      
+      res.json({ message: fallbackMessage });
+    }
+  } catch (error) {
+    console.error('Error in generate-mentor-first-message:', error);
+    // Fallback to template
+    const subtasksList = Array.isArray(req.body?.subtasks) && req.body?.subtasks.length > 0
+      ? req.body.subtasks.map(st => `- ${st}`).join('\n')
+      : '';
+    
+    const fallbackMessage = `Welcome. Today we'll focus on ${req.body?.topic || 'today\'s topic'}.
+${subtasksList ? `By the end of this session, you should understand:\n${subtasksList}\n` : ''}You can start by asking one of the questions below.`;
+    
+    res.json({ message: fallbackMessage });
+  }
+});
+
+/**
+ * POST /api/generate-starter-questions
+ * 
+ * ⚠️ Frontend–backend contract: do not rename without updating both.
+ * 
+ * Generates exactly 3 AI-suggested starter questions for FIRST INTERACTION.
+ * Used when user opens a day's learning page and no mentor interaction has occurred.
+ * 
+ * GENERATION RULES:
+ * - Uses ONLY today's Day Knowledge Base (topic + subtasks)
+ * - Does NOT use mentor answers (none exist yet)
+ * - Does NOT use previous days or general knowledge
+ * 
+ * REQUEST BODY:
+ * {
+ *   topic: string (required),
+ *   subtasks: string[] (optional)
+ * }
+ * 
+ * RESPONSE:
+ * {
+ *   questions: string[] (exactly 3 questions, or empty array on failure)
+ * }
+ */
+app.post('/api/generate-starter-questions', async (req, res) => {
+  try {
+    // ⚠️ Frontend–backend contract: field names must match exactly
+    const { topic, subtasks } = req.body;
+    
+    // Validation: topic is required
+    if (!topic || typeof topic !== 'string' || topic.trim().length === 0) {
+      return res.status(400).json({ error: 'topic is required and must be a non-empty string' });
+    }
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    
+    // SAFE MOCK RESPONSE: If AI logic is missing, return mock starter questions
+    if (!apiKey) {
+      console.log('⚠️  OPENAI_API_KEY not found. Using mock starter questions.');
+      const mockQuestions = [
+        `What is ${topic}?`,
+        `How do I get started with ${topic}?`,
+        `What are the basics of ${topic}?`
+      ];
+      return res.json({ questions: mockQuestions });
+    }
+    
+    // Real OpenAI API call
+    try {
+      const { default: OpenAI } = await import('openai');
+      const openai = new OpenAI({ apiKey });
+      
+      // Enforce token limit
+      const maxTokens = AI_LIMITS.SUGGESTIONS;
+      validateTokenLimit('SUGGESTIONS', maxTokens);
+      
+      // Build context (ONLY today's topic and subtasks - no mentor answer)
+      const subtasksText = Array.isArray(subtasks) && subtasks.length > 0
+        ? `Subtasks: ${subtasks.join(', ')}`
+        : '';
+      
+      const context = `Today's topic: ${topic}
+${subtasksText ? subtasksText : ''}`;
+      
+      // Use EXACT instruction as specified (verbatim)
+      const instruction = `Using ONLY today's learning topic and subtasks,
+generate exactly 3 simple starter questions
+a learner might ask to begin understanding this topic.
+
+STRICT RULES:
+- Questions MUST be ONLY about today's topic and subtasks
+- Do NOT introduce new concepts
+- Do NOT ask about future topics
+- Do NOT ask about previous days
+- Do NOT ask about general knowledge outside today's scope
+- Questions must be directly related to the topic and subtasks provided
+
+Return ONLY a JSON array of strings.`;
+      
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: "You are a learning assistant that generates starter questions. Questions must ONLY be about today's topic and subtasks. Do NOT generate questions about other topics, future content, or general knowledge. Return only a JSON array of exactly 3 question strings. No explanations, no markdown, no other text."
+          },
+          {
+            role: "user",
+            content: `${context}\n\n${instruction}`
+          }
+        ],
+        temperature: AI_TEMPERATURES.SUGGESTIONS,  // 0.3 for question generation
+        max_tokens: maxTokens,  // 300 tokens max
+        stream: false
+      });
+      
+      // Log token usage
+      if (response.usage) {
+        console.log(`📊 Starter questions tokens: ${response.usage.total_tokens} (limit: ${maxTokens})`);
+      }
+      
+      const content = response.choices[0].message.content.trim();
+      
+      // Remove markdown code blocks if present
+      const jsonContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      
+      // Parse JSON array
+      let questions = [];
+      try {
+        const parsed = JSON.parse(jsonContent);
+        // Ensure it's an array
+        if (Array.isArray(parsed)) {
+          // Take exactly 3 questions, filter out empty strings
+          questions = parsed
+            .filter(q => typeof q === 'string' && q.trim().length > 0)
+            .slice(0, 3)
+            .map(q => q.trim());
+        }
+      } catch (parseError) {
+        console.warn('⚠️  Failed to parse starter questions JSON');
+        // Fallback: return empty array (silent failure)
+        return res.json({ questions: [] });
+      }
+      
+      // Ensure exactly 3 questions
+      if (questions.length === 0) {
+        return res.json({ questions: [] });
+      }
+      
+      // Return exactly 3 questions (or fewer if generation failed)
+      const finalQuestions = questions.slice(0, 3);
+      res.json({ questions: finalQuestions });
+    } catch (error) {
+      console.error('OpenAI API error in generate-starter-questions:', error.message);
+      // Silent failure: return empty array
+      res.json({ questions: [] });
+    }
+  } catch (error) {
+    console.error('Error in generate-starter-questions:', error);
+    // Silent failure: return empty array
+    res.json({ questions: [] });
+  }
+});
+
+/**
  * POST /api/generate-suggested-questions
  * 
  * ⚠️ Frontend–backend contract: do not rename without updating both.
@@ -1784,7 +2701,7 @@ Requirements:
  * - Mentor's last answer
  * 
  * STRICT SCOPE: Only uses today's context, no external knowledge
- * TOKEN LIMIT: 200-250 tokens max
+ * TOKEN LIMIT: 300 tokens max
  * 
  * REQUEST BODY:
  * {
@@ -1848,14 +2765,25 @@ app.post('/api/generate-suggested-questions', async (req, res) => {
 ${subtasksText ? subtasksText + '\n' : ''}Mentor's last answer: ${lastAnswer}`;
       
       // Use exact instruction as specified
-      const instruction = `Using ONLY the context provided above, generate exactly 3 short, clear follow-up questions that a learner could naturally ask next. Do NOT introduce new concepts or future topics. Do NOT include explanations. Return ONLY the questions as a JSON array of strings.`;
+      const instruction = `Using ONLY the context provided above (today's topic, subtasks, and mentor's last answer), generate exactly 3 short, clear follow-up questions that a learner could naturally ask next.
+
+STRICT RULES:
+- Questions MUST be ONLY about today's topic and subtasks
+- Questions MUST be based on the mentor's last answer (which is about today's topic)
+- Do NOT introduce new concepts
+- Do NOT ask about future topics
+- Do NOT ask about previous days
+- Do NOT ask about general knowledge outside today's scope
+- Questions must be directly related to what was discussed in the mentor's answer
+
+Do NOT include explanations. Return ONLY the questions as a JSON array of strings.`;
       
       const response = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
-            content: "You are a learning assistant that generates focused follow-up questions. Return only a JSON array of exactly 3 question strings. No explanations, no markdown, no other text."
+            content: "You are a learning assistant that generates focused follow-up questions. Questions must ONLY be about today's topic and subtasks, based on the mentor's answer. Do NOT generate questions about other topics, future content, previous days, or general knowledge. Return only a JSON array of exactly 3 question strings. No explanations, no markdown, no other text."
           },
           {
             role: "user",
@@ -1863,7 +2791,7 @@ ${subtasksText ? subtasksText + '\n' : ''}Mentor's last answer: ${lastAnswer}`;
           }
         ],
         temperature: AI_TEMPERATURES.SUGGESTIONS,  // 0.3 for question generation
-        max_tokens: maxTokens,  // 250 tokens max
+        max_tokens: maxTokens,  // 300 tokens max
         stream: false
       });
       
@@ -1930,13 +2858,24 @@ app.get('/api/syllabus', (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ 
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0',
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📝 API endpoint: http://localhost:${PORT}/api/generate-syllabus`);
-  console.log(`💬 Chat endpoint: http://localhost:${PORT}/api/topic-chat`);
-  console.log(`📊 Evaluation endpoint: http://localhost:${PORT}/api/evaluate-learning`);
-});
+// Export app for Vercel serverless (always export)
+export default app;
+
+// Start server for local development only
+if (!process.env.VERCEL && !process.env.VERCEL_ENV) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📝 API endpoint: http://localhost:${PORT}/api/generate-syllabus`);
+    console.log(`💬 Chat endpoint: http://localhost:${PORT}/api/topic-chat`);
+    console.log(`📊 Evaluation endpoint: http://localhost:${PORT}/api/evaluate-learning`);
+  });
+}
 

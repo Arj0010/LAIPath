@@ -7,11 +7,13 @@
 
 export const AI_LIMITS = {
   // Token limits per API call type
-  SYLLABUS: 450,    // Syllabus generation (max 450 tokens - reduced for JSON efficiency)
-  CHAT: 300,        // Topic-level chat (max 300 tokens)
+  SYLLABUS: 900,    // Syllabus generation (max 900 tokens - increased for richer descriptions)
+  CHAT: 1000,       // Topic-level chat (max 1000 tokens - increased for longer explanations)
   LINKEDIN: 200,    // LinkedIn draft generation (max 200 tokens)
-  SUGGESTIONS: 250, // Suggested questions generation (max 250 tokens)
-  EVALUATION: 300   // Learning evaluation (max 300 tokens)
+  SUGGESTIONS: 300, // Suggested questions generation (max 300 tokens)
+  EVALUATION: 280,  // Learning evaluation (max 280 tokens - optimized for faster response)
+  CONCEPT_EXTRACTION: 150,  // Concept extraction from mentor answers (max 150 tokens)
+  FIRST_MESSAGE: 250  // Mentor first message generation (max 250 tokens)
 };
 
 export const AI_TEMPERATURES = {
@@ -19,7 +21,9 @@ export const AI_TEMPERATURES = {
   CHAT: 0.3,        // Moderate temperature for topic chat
   LINKEDIN: 0.4,    // Slightly higher for creative LinkedIn posts
   SUGGESTIONS: 0.3, // Moderate temperature for question generation
-  EVALUATION: 0.2   // Low temperature for conservative evaluation
+  EVALUATION: 0.2,  // Low temperature for conservative evaluation
+  CONCEPT_EXTRACTION: 0.1,  // Very low temperature for deterministic concept extraction
+  FIRST_MESSAGE: 0.2  // Low temperature for instructional first message
 };
 
 /**

@@ -25,6 +25,11 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
   const [copySuccess, setCopySuccess] = useState(false)
   const [copyError, setCopyError] = useState(null)
   const [suggestedQuestions, setSuggestedQuestions] = useState({}) // Map of message index to questions
+  const [starterQuestions, setStarterQuestions] = useState([]) // Starter questions for first interaction
+  const [starterQuestionsLoading, setStarterQuestionsLoading] = useState(false)
+  const [hasFirstInteraction, setHasFirstInteraction] = useState(false) // Track if user has asked first question
+  const [mentorFirstMessage, setMentorFirstMessage] = useState('') // Mentor-initiated first message
+  const [firstMessageLoading, setFirstMessageLoading] = useState(false) // Loading state for first message
 
   // Clear chat when day changes
   useEffect(() => {
@@ -33,7 +38,175 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
     setInputMessage('')
     setError(null)
     setSuggestedQuestions({})
+    setStarterQuestions([])
+    setHasFirstInteraction(false)
+    setMentorFirstMessage('') // Reset first message on day change
   }, [day.dayNumber])
+
+  /**
+   * Generate template-based first message instantly
+   * This appears immediately while AI generation happens in background
+   */
+  function generateTemplateFirstMessage() {
+    if (!day.topic) return ''
+    
+    const subtasksList = Array.isArray(day.subtasks) && day.subtasks.length > 0
+      ? day.subtasks.map(st => `- ${st}`).join('\n')
+      : ''
+    
+    const templateMessage = `Welcome. Today we'll focus on ${day.topic}.
+${subtasksList ? `By the end of this session, you should understand:\n${subtasksList}\n` : ''}You can start by asking one of the questions below.`
+    
+    return templateMessage
+  }
+
+  /**
+   * Generate mentor's first message for instructional orientation
+   * Called when chat is opened and no messages exist
+   * Uses ONLY topic and subtasks (no mentor answer)
+   * Shows template immediately, then optionally enhances with AI
+   */
+  async function generateMentorFirstMessage() {
+    if (!day.topic || hasFirstInteraction || mentorFirstMessage) {
+      return // Don't fetch if already have message or user has interacted
+    }
+
+    // Show template message immediately for instant display
+    const templateMessage = generateTemplateFirstMessage()
+    if (templateMessage) {
+      setMentorFirstMessage(templateMessage)
+    }
+
+    // Optionally enhance with AI in background (non-blocking)
+    setFirstMessageLoading(true)
+
+    try {
+      const response = await fetch('/api/generate-mentor-first-message', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        // ⚠️ Frontend–backend contract: field names must match exactly
+        body: JSON.stringify({
+          topic: day.topic,
+          subtasks: day.subtasks || [],
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        
+        // Only replace template if AI message is better (non-empty and different)
+        if (data.message && typeof data.message === 'string' && data.message.trim().length > 0) {
+          const aiMessage = data.message.trim()
+          // Only update if AI message is different and more informative
+          if (aiMessage !== templateMessage && aiMessage.length > templateMessage.length * 0.8) {
+            setMentorFirstMessage(aiMessage)
+          }
+        }
+      }
+      // If API fails, keep the template message (silent failure)
+    } catch (err) {
+      // Silent failure: keep template message
+      console.error('Error generating mentor first message:', err)
+    } finally {
+      setFirstMessageLoading(false)
+    }
+  }
+
+  /**
+   * Generate template-based first starter question from first subtask
+   * This appears instantly while AI generates the remaining questions
+   * Just displays the subtask as-is, no conversion to question format
+   */
+  function generateTemplateFirstQuestion() {
+    if (!day.subtasks || !Array.isArray(day.subtasks) || day.subtasks.length === 0) {
+      return null
+    }
+    
+    const firstSubtask = day.subtasks[0].trim()
+    if (!firstSubtask) return null
+    
+    // Return subtask as-is, no question conversion
+    return firstSubtask
+  }
+
+  /**
+   * Generate starter questions for first interaction
+   * First question comes from first subtask (instant)
+   * Remaining questions come from AI (background)
+   */
+  async function generateStarterQuestions() {
+    if (!day.topic || hasFirstInteraction || starterQuestions.length > 0) {
+      return // Don't fetch if already have questions or user has interacted
+    }
+
+    // Show first question instantly from first subtask
+    const templateFirstQuestion = generateTemplateFirstQuestion()
+    if (templateFirstQuestion) {
+      setStarterQuestions([templateFirstQuestion])
+    }
+
+    // Generate remaining questions via AI in background
+    setStarterQuestionsLoading(true)
+
+    try {
+      const response = await fetch('/api/generate-starter-questions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        // ⚠️ Frontend–backend contract: field names must match exactly
+        body: JSON.stringify({
+          topic: day.topic,
+          subtasks: day.subtasks || [],
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        
+        if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+          const aiQuestions = data.questions.slice(0, 3) // Take up to 3 questions
+          
+          // If we have a template first question, use it as first, then add 2 AI questions
+          if (templateFirstQuestion && aiQuestions.length >= 2) {
+            // Use template first question + 2 AI questions = 3 total
+            setStarterQuestions([templateFirstQuestion, ...aiQuestions.slice(0, 2)])
+          } else if (templateFirstQuestion && aiQuestions.length === 1) {
+            // Use template first question + 1 AI question = 2 total
+            setStarterQuestions([templateFirstQuestion, aiQuestions[0]])
+          } else if (aiQuestions.length > 0) {
+            // Use AI questions if template didn't work
+            setStarterQuestions(aiQuestions)
+          }
+        } else if (templateFirstQuestion) {
+          // If AI fails but we have template, keep it
+          // Don't update - already set above
+        }
+      }
+      // Silent failure: keep template question if AI fails
+    } catch (err) {
+      // Silent failure: keep template question
+      console.error('Error generating starter questions:', err)
+    } finally {
+      setStarterQuestionsLoading(false)
+    }
+  }
+
+  // Fetch mentor first message and starter questions when chat is opened and no messages exist
+  useEffect(() => {
+    if (showChat && messages.length === 0 && !hasFirstInteraction) {
+      // Fetch immediately when chat opens
+      if (!mentorFirstMessage && !firstMessageLoading) {
+        generateMentorFirstMessage()
+      }
+      if (starterQuestions.length === 0 && !starterQuestionsLoading) {
+        generateStarterQuestions()
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showChat, day.dayNumber, messages.length]) // Trigger when chat opens, day changes, or messages change
 
   /**
    * Generate AI-suggested follow-up questions
@@ -87,11 +260,18 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
   }
 
   /**
-   * Handle clicking a suggested question
+   * Handle clicking a suggested question (or starter question)
    * Sends it as the next user question
    */
   async function handleSuggestedQuestionClick(question) {
     if (chatLoading || !question.trim()) return
+
+    // Mark first interaction if clicking a starter question
+    if (!hasFirstInteraction) {
+      setHasFirstInteraction(true)
+      setMentorFirstMessage('') // Clear first message immediately
+      setStarterQuestions([]) // Clear starter questions immediately
+    }
 
     const userMessage = question.trim()
     setInputMessage('')
@@ -195,6 +375,13 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
     const userMessage = inputMessage.trim()
     setInputMessage('')
     setError(null)
+
+    // Mark first interaction - this will hide first message and starter questions
+    if (!hasFirstInteraction) {
+      setHasFirstInteraction(true)
+      setMentorFirstMessage('') // Clear first message immediately
+      setStarterQuestions([]) // Clear starter questions immediately
+    }
 
     // Add user message to chat
     const newMessages = [...messages, { role: 'user', content: userMessage }]
@@ -343,7 +530,10 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
     setError(null)
     
     try {
-      // Step 1: Evaluate learning input
+      // Step 1: Evaluate learning input (with timeout)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 35000) // 35 second timeout
+      
       const evalResponse = await fetch('/api/evaluate-learning', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -351,8 +541,11 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
           topic: day.topic,
           subtasks: day.subtasks || [],
           learningInput: learningInput
-        })
+        }),
+        signal: controller.signal
       })
+      
+      clearTimeout(timeoutId)
 
       if (!evalResponse.ok) {
         throw new Error('Failed to evaluate learning')
@@ -429,7 +622,13 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
       setShowEndDayModal(false)
     } catch (err) {
       console.error('Error ending day:', err)
+      // Handle timeout specifically
+      if (err.name === 'AbortError' || err.message?.includes('timeout') || err.message?.includes('aborted')) {
+        throw new Error('Evaluation is taking longer than expected. Please try again.')
+      }
       throw err
+    } finally {
+      setSubmittingDay(false)
     }
   }
 
@@ -688,12 +887,61 @@ function DailyLearningPage({ day, syllabus, onSyllabusUpdate, onBack }) {
             </div>
             <div className="card-body">
               <div className="chat-messages">
-              {messages.length === 0 ? (
-                <div className="chat-empty">
-                  <p>Ask me anything about: <strong>{day.topic}</strong></p>
-                  <p className="chat-hint">I'll only answer questions related to today's topic.</p>
-                </div>
-              ) : (
+              {/* Mentor's first message for instructional orientation - shows before any user messages */}
+              {messages.length === 0 && !hasFirstInteraction && showChat && (
+                <>
+                  {/* Show first message (template appears instantly, AI enhances if available) */}
+                  {mentorFirstMessage && mentorFirstMessage.trim().length > 0 ? (
+                    <div className="chat-message assistant mentor-first-message">
+                      <div className="message-role">AI Expert</div>
+                      <div className="message-content">{mentorFirstMessage}</div>
+                    </div>
+                  ) : (
+                    <div className="chat-message assistant">
+                      <div className="message-role">AI Expert</div>
+                      <div className="message-content">Preparing your learning session...</div>
+                    </div>
+                  )}
+                  
+                  {/* Starter questions below first message - always show when first message is visible */}
+                  <div className="starter-questions">
+                    {starterQuestions && Array.isArray(starterQuestions) && starterQuestions.length > 0 ? (
+                      <>
+                        <div className="starter-questions-label">Get started with:</div>
+                        <div className="starter-questions-list">
+                          {starterQuestions.map((question, qIdx) => (
+                            <button
+                              key={qIdx}
+                              type="button"
+                              className="suggested-question-button starter-question-button"
+                              onClick={() => handleSuggestedQuestionClick(question)}
+                              disabled={chatLoading}
+                            >
+                              {question}
+                            </button>
+                          ))}
+                        </div>
+                        {starterQuestionsLoading && starterQuestions.length < 3 && (
+                          <div className="starter-questions-loading" style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>
+                            <p>Generating more questions...</p>
+                          </div>
+                        )}
+                      </>
+                    ) : starterQuestionsLoading ? (
+                      <div className="starter-questions-loading">
+                        <p>Generating starter questions...</p>
+                      </div>
+                    ) : (
+                      <div className="starter-questions-loading">
+                        <p>Preparing starter questions...</p>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+              
+              {/* Regular chat messages */}
+              {messages.length > 0 && (
                 messages.map((msg, idx) => {
                   // Get suggestions for this message index (if available)
                   const suggestions = msg.role === 'assistant' ? suggestedQuestions[idx] : null

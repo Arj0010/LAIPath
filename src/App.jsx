@@ -869,6 +869,17 @@ function App() {
             <span className="nav-label">Calendar</span>
             {!syllabus && <span className="nav-lock-icon">🔒</span>}
           </button>
+          <button
+            onClick={() => {
+              setCurrentView('profile')
+              setSelectedDay(null)
+            }}
+            className={`nav-item ${currentView === 'profile' ? 'active' : ''}`}
+            title="View profile"
+          >
+            <span className="nav-icon">👤</span>
+            <span className="nav-label">Profile</span>
+          </button>
         </nav>
       </aside>
 
@@ -914,6 +925,10 @@ function App() {
                       <div className="profile-dropdown-stat">
                         <span className="stat-label">Level</span>
                         <span className="stat-value">{level} {milestone}</span>
+                      </div>
+                      <div className="profile-dropdown-stat">
+                        <span className="stat-label">XP</span>
+                        <span className="stat-value">{xp}</span>
                       </div>
                       <div className="profile-dropdown-stat">
                         <span className="stat-label">Streak</span>
@@ -1014,6 +1029,10 @@ function App() {
                           <div className="profile-dropdown-stat">
                             <span className="stat-label">Level</span>
                             <span className="stat-value">{level} {milestone}</span>
+                          </div>
+                          <div className="profile-dropdown-stat">
+                            <span className="stat-label">XP</span>
+                            <span className="stat-value">{xp}</span>
                           </div>
                           <div className="profile-dropdown-stat">
                             <span className="stat-label">Streak</span>
@@ -1287,12 +1306,9 @@ function App() {
                         {day.subtasks && day.subtasks.length > 0 && (
                           <div className="day-item-subtasks">
                             <ul>
-                              {day.subtasks.slice(0, 2).map((subtask, idx) => (
+                              {day.subtasks.map((subtask, idx) => (
                                 <li key={idx}>{subtask}</li>
                               ))}
-                              {day.subtasks.length > 2 && (
-                                <li className="more-subtasks">+{day.subtasks.length - 2} more</li>
-                              )}
                             </ul>
                           </div>
                         )}

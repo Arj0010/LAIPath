@@ -422,6 +422,38 @@
   gap: var(--spacing-xs);
 }
 
+/* Starter Questions Styles (for first interaction) */
+.starter-questions {
+  margin-top: var(--spacing-md);
+  padding-top: var(--spacing-md);
+  border-top: 1px solid var(--border-subtle);
+  width: 100%;
+}
+
+.starter-questions-label {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  margin-bottom: var(--spacing-sm);
+  font-weight: 600;
+}
+
+.starter-questions-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.starter-questions-loading {
+  padding: var(--spacing-sm);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-style: italic;
+}
+
+.starter-question-button {
+  /* Inherit from suggested-question-button but can be customized */
+}
+
 .suggested-question-button {
   padding: var(--spacing-xs) var(--spacing-sm);
   background-color: transparent;
