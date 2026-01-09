@@ -4,6 +4,15 @@ import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { AI_LIMITS, AI_TEMPERATURES, validateTokenLimit } from './aiConfig.js';
+import {
+  sanitizeInput,
+  sanitizeError,
+  validateAndSanitizeBody,
+  apiRateLimiter,
+  aiRateLimiter,
+  getCorsOptions,
+  securityHeaders
+} from './security.js';
 
 // Get the directory of the current module (server.js)
 const __filename = fileURLToPath(import.meta.url);
@@ -19,10 +28,19 @@ if (!process.env.OPENAI_API_KEY) {
 
 const app = express();
 const PORT = 3001;
+const isDevelopment = process.env.NODE_ENV !== 'production';
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Security middleware (apply to all routes)
+app.use(securityHeaders);
+
+// CORS configuration (restrictive)
+app.use(cors(getCorsOptions()));
+
+// Body parsing with size limit
+app.use(express.json({ limit: '10mb' }));
+
+// Apply general rate limiting to all API routes
+app.use('/api', apiRateLimiter);
 
 // In-memory store for syllabus (Day 1: single syllabus only)
 let syllabus = null;
@@ -325,9 +343,15 @@ function isAllowedLearningDomain(goalText) {
  * POST /api/generate-syllabus
  * Generates a learning syllabus based on goal, hours per day, and total days
  */
-app.post('/api/generate-syllabus', async (req, res) => {
+app.post('/api/generate-syllabus', aiRateLimiter, async (req, res) => {
   try {
-    const { goal, hoursPerDay, totalDays } = req.body;
+    // Validate and sanitize request body
+    const validation = validateAndSanitizeBody(req.body, ['goal', 'hoursPerDay', 'totalDays']);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error || 'Invalid request' });
+    }
+    
+    const { goal, hoursPerDay, totalDays } = validation.sanitized;
     
     // Validation
     if (!goal || typeof goal !== 'string' || goal.trim().length === 0) {
@@ -1577,9 +1601,15 @@ function rephraseQuestion(question, topic, subtasks = []) {
  * Uses ONLY: currentDayTopic, currentDaySubtasks
  * NO prompt-only system, NO aiExpertPrompt dependency
  */
-app.post('/api/topic-chat', async (req, res) => {
+app.post('/api/topic-chat', aiRateLimiter, async (req, res) => {
   try {
-    const { userMessage, currentDayTopic, currentDaySubtasks, currentDayNotes } = req.body;
+    // Validate and sanitize request body
+    const validation = validateAndSanitizeBody(req.body, ['userMessage', 'currentDayTopic']);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error || 'Invalid request' });
+    }
+    
+    const { userMessage, currentDayTopic, currentDaySubtasks, currentDayNotes } = validation.sanitized;
     
     // Validation
     if (!userMessage || typeof userMessage !== 'string' || userMessage.trim().length === 0) {
@@ -1968,9 +1998,15 @@ app.post('/api/topic-chat', async (req, res) => {
  * Evaluates learning input and determines if syllabus should be adjusted
  * Returns: { action: "continue" | "adjust" }
  */
-app.post('/api/evaluate-learning', async (req, res) => {
+app.post('/api/evaluate-learning', aiRateLimiter, async (req, res) => {
   try {
-    const { topic, subtasks, learningInput } = req.body;
+    // Validate and sanitize request body
+    const validation = validateAndSanitizeBody(req.body, ['topic', 'learningInput']);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error || 'Invalid request' });
+    }
+    
+    const { topic, subtasks, learningInput } = validation.sanitized;
     
     // Validation
     if (!topic || typeof topic !== 'string' || topic.trim().length === 0) {
@@ -2102,7 +2138,8 @@ Default if insufficient: understanding_level="basic", confidence="medium", recom
     }
   } catch (error) {
     console.error('Error in evaluate-learning:', error);
-    res.status(500).json({ error: 'Failed to evaluate learning', message: error.message });
+    const safeError = sanitizeError(error, isDevelopment);
+    res.status(500).json({ error: 'Failed to evaluate learning', message: safeError });
   }
 });
 
@@ -2156,7 +2193,8 @@ app.post('/api/regenerate-future-days', async (req, res) => {
     res.json({ days: adjustedDays });
   } catch (error) {
     console.error('Error regenerating future days:', error);
-    res.status(500).json({ error: 'Failed to regenerate days', message: error.message });
+    const safeError = sanitizeError(error, isDevelopment);
+    res.status(500).json({ error: 'Failed to regenerate days', message: safeError });
   }
 });
 
@@ -2215,7 +2253,8 @@ app.post('/api/update-syllabus', async (req, res) => {
     res.json({ success: true, syllabus });
   } catch (error) {
     console.error('Error updating syllabus:', error);
-    res.status(500).json({ error: 'Failed to update syllabus', message: error.message });
+    const safeError = sanitizeError(error, isDevelopment);
+    res.status(500).json({ error: 'Failed to update syllabus', message: safeError });
   }
 });
 
@@ -2240,7 +2279,8 @@ app.post('/api/reset-day-knowledge', async (req, res) => {
     });
   } catch (error) {
     console.error('Error resetting DKB:', error);
-    res.status(500).json({ error: 'Failed to reset DKB', message: error.message });
+    const safeError = sanitizeError(error, isDevelopment);
+    res.status(500).json({ error: 'Failed to reset DKB', message: safeError });
   }
 });
 
@@ -2293,7 +2333,7 @@ app.get('/api/day-knowledge', (req, res) => {
  * Generates a LinkedIn post draft from completed day's topic and learning input
  * Day 5: LinkedIn draft generator
  */
-app.post('/api/generate-linkedin-draft', async (req, res) => {
+app.post('/api/generate-linkedin-draft', aiRateLimiter, async (req, res) => {
   try {
     const { topic, learningInput } = req.body;
     
@@ -2413,7 +2453,7 @@ Requirements:
  *   message: string (the first message text, or empty string on failure)
  * }
  */
-app.post('/api/generate-mentor-first-message', async (req, res) => {
+app.post('/api/generate-mentor-first-message', aiRateLimiter, async (req, res) => {
   try {
     // ⚠️ Frontend–backend contract: field names must match exactly
     const { topic, subtasks } = req.body;
@@ -2570,7 +2610,7 @@ ${subtasksList ? `By the end of this session, you should understand:\n${subtasks
  *   questions: string[] (exactly 3 questions, or empty array on failure)
  * }
  */
-app.post('/api/generate-starter-questions', async (req, res) => {
+app.post('/api/generate-starter-questions', aiRateLimiter, async (req, res) => {
   try {
     // ⚠️ Frontend–backend contract: field names must match exactly
     const { topic, subtasks } = req.body;
@@ -2715,7 +2755,7 @@ Return ONLY a JSON array of strings.`;
  *   questions: string[] (exactly 3 questions, or empty array on failure)
  * }
  */
-app.post('/api/generate-suggested-questions', async (req, res) => {
+app.post('/api/generate-suggested-questions', aiRateLimiter, async (req, res) => {
   try {
     // ⚠️ Frontend–backend contract: field names must match exactly
     const { topic, subtasks, lastAnswer } = req.body;
