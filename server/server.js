@@ -406,9 +406,10 @@ app.post('/api/generate-syllabus', aiRateLimiter, async (req, res) => {
   } catch (error) {
     console.error('Error generating syllabus:', error);
     // BACKEND ERROR SAFETY: Always return valid JSON, never empty response
+    const safeError = sanitizeError(error, isDevelopment);
     res.status(500).json({ 
       error: 'Syllabus generation failed', 
-      message: error.message,
+      message: safeError,
       fallback: true 
     });
   }
